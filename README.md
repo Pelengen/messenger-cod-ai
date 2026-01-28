@@ -19,4 +19,4 @@ https://github.com/user-attachments/assets/4141ba82-8b15-480d-b8ef-73c97af32838
 
   https://github.com/Pelengen/messenger-cod-ai/tree/only-deepseek-2 - перестала работать возможность авторизации у клиента + много проблем
 
-  
+  https://github.com/Pelengen/messenger-cod-ai/tree/deepseek%2Bchatgpt%2Bclaude - +-близок к идеалу + много багов
