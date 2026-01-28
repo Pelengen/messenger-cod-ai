@@ -1,0 +1,929 @@
+import sys
+import socket
+import threading
+import json
+import sqlite3
+import base64
+import hashlib
+import os
+from datetime import datetime
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
+from cryptography.fernet import Fernet
+
+
+class SecureServer:
+    def __init__(self, host='0.0.0.0', port=5555):
+        self.host = host
+        self.port = port
+        self.server_socket = None
+        self.running = False
+        self.clients = {}
+        self.lock = threading.Lock()
+
+        # Убедимся, что база существует
+        self.init_database()
+
+    def init_database(self):
+        self.conn = sqlite3.connect('secure_messenger.db', check_same_thread=False)
+        self.cursor = self.conn.cursor()
+
+        # Таблица пользователей
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                avatar TEXT,
+                registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP,
+                encryption_key TEXT NOT NULL
+            )
+        ''')
+
+        # Таблица сообщений
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                message TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                delivered INTEGER DEFAULT 0
+            )
+        ''')
+
+        # Таблица файлов
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_data TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                delivered INTEGER DEFAULT 0
+            )
+        ''')
+
+        # Создаем тестового пользователя, если его нет
+        self.cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'testuser'")
+        if self.cursor.fetchone()[0] == 0:
+            test_password = hashlib.sha256("test123".encode()).hexdigest()
+            encryption_key = base64.b64encode(Fernet.generate_key()).decode()
+            try:
+                self.cursor.execute(
+                    "INSERT INTO users (username, email, password_hash, encryption_key) VALUES (?, ?, ?, ?)",
+                    ("testuser", "test@example.com", test_password, encryption_key)
+                )
+                self.conn.commit()
+                print("Создан тестовый пользователь: testuser / test123")
+            except:
+                pass
+
+        print("База данных готова")
+
+    def generate_encryption_key(self):
+        key = Fernet.generate_key()
+        return base64.b64encode(key).decode()
+
+    def start(self):
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(10)
+            self.running = True
+
+            print(f"Сервер запущен на {self.host}:{self.port}")
+
+            accept_thread = threading.Thread(target=self.accept_connections)
+            accept_thread.daemon = True
+            accept_thread.start()
+
+            return True
+        except Exception as e:
+            print(f"Ошибка запуска сервера: {e}")
+            return False
+
+    def stop(self):
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+
+        with self.lock:
+            for username, client_data in list(self.clients.items()):
+                try:
+                    client_data['socket'].close()
+                except:
+                    pass
+            self.clients.clear()
+
+        print("Сервер остановлен")
+
+    def accept_connections(self):
+        while self.running:
+            try:
+                client_socket, address = self.server_socket.accept()
+                print(f"Новое подключение от {address}")
+
+                client_thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(client_socket, address)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+
+            except Exception as e:
+                if self.running:
+                    print(f"Ошибка принятия соединения: {e}")
+                break
+
+    def handle_client(self, client_socket, address):
+        client_fernet = None
+        username = None
+
+        try:
+            while self.running:
+                try:
+                    # Читаем длину сообщения
+                    length_data = client_socket.recv(4)
+                    if not length_data:
+                        break
+
+                    message_length = int.from_bytes(length_data, 'big')
+
+                    if message_length > 10 * 1024 * 1024:
+                        print(f"Слишком большое сообщение от {address}")
+                        break
+
+                    # Читаем само сообщение
+                    data = b''
+                    while len(data) < message_length:
+                        chunk = client_socket.recv(min(4096, message_length - len(data)))
+                        if not chunk:
+                            break
+                        data += chunk
+
+                    if not data or len(data) != message_length:
+                        break
+
+                    # Парсим JSON
+                    try:
+                        request = json.loads(data.decode('utf-8'))
+                    except:
+                        print(f"Неверный JSON от {address}")
+                        continue
+
+                    # Обрабатываем запрос
+                    response = self.process_request(request, username, client_fernet)
+
+                    # Если это регистрация или вход, обновляем данные клиента
+                    if request.get('action') in ['register', 'login'] and response.get('status') == 'success':
+                        username = request.get('username')
+                        if 'encryption_key' in response:
+                            try:
+                                encryption_key = base64.b64decode(response['encryption_key'])
+                                client_fernet = Fernet(base64.b64encode(encryption_key[:32]))
+                                with self.lock:
+                                    self.clients[username] = {
+                                        'socket': client_socket,
+                                        'fernet': client_fernet,
+                                        'address': address
+                                    }
+                            except Exception as e:
+                                print(f"Ошибка создания fernet для {username}: {e}")
+
+                    # Отправляем ответ
+                    response_data = json.dumps(response).encode('utf-8')
+                    client_socket.send(len(response_data).to_bytes(4, 'big'))
+                    client_socket.send(response_data)
+
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    print(f"Ошибка обработки запроса от {address}: {e}")
+                    break
+
+        except Exception as e:
+            print(f"Критическая ошибка обработки клиента {address}: {e}")
+        finally:
+            if username:
+                with self.lock:
+                    if username in self.clients:
+                        del self.clients[username]
+            try:
+                client_socket.close()
+            except:
+                pass
+            print(f"Клиент {address} отключен")
+
+    def process_request(self, request, username, client_fernet):
+        action = request.get('action')
+
+        try:
+            if action == 'register':
+                return self.handle_register(request)
+            elif action == 'login':
+                return self.handle_login(request)
+            elif action == 'send_message':
+                return self.handle_send_message(request, username)
+            elif action == 'send_file':
+                return self.handle_send_file(request, username)
+            elif action == 'start_voice_call':
+                return self.handle_start_voice_call(request)
+            elif action == 'get_messages':
+                return self.handle_get_messages(request)
+            elif action == 'search_users':
+                return self.handle_search_users(request)
+            elif action == 'update_profile':
+                return self.handle_update_profile(request)
+            elif action == 'get_user_avatar':
+                return self.handle_get_user_avatar(request)
+            else:
+                return {'status': 'error', 'message': 'Неизвестное действие'}
+        except Exception as e:
+            print(f"Ошибка обработки действия {action}: {e}")
+            return {'status': 'error', 'message': 'Ошибка сервера'}
+
+    def handle_register(self, request):
+        try:
+            username = request.get('username', '').strip()
+            email = request.get('email', '').strip().lower()
+            password_hash = request.get('password')
+
+            print(f"Попытка регистрации: username={username}, email={email}")
+
+            if not username or not email or not password_hash:
+                return {'status': 'error', 'message': 'Все поля обязательны'}
+
+            if len(username) < 3:
+                return {'status': 'error', 'message': 'Имя должно быть не менее 3 символов'}
+
+            if '@' not in email or '.' not in email:
+                return {'status': 'error', 'message': 'Некорректный email'}
+
+            # Проверяем существование пользователя
+            self.cursor.execute(
+                "SELECT username, email FROM users WHERE username = ? OR email = ?",
+                (username, email)
+            )
+            existing = self.cursor.fetchone()
+
+            if existing:
+                existing_username, existing_email = existing
+                if existing_username == username:
+                    return {'status': 'error', 'message': 'Имя пользователя уже занято'}
+                elif existing_email == email:
+                    return {'status': 'error', 'message': 'Email уже зарегистрирован'}
+
+            # Генерируем ключ шифрования
+            encryption_key = self.generate_encryption_key()
+
+            # Сохраняем пользователя
+            self.cursor.execute(
+                "INSERT INTO users (username, email, password_hash, encryption_key) VALUES (?, ?, ?, ?)",
+                (username, email, password_hash, encryption_key)
+            )
+            self.conn.commit()
+
+            print(f"Пользователь {username} успешно зарегистрирован")
+
+            return {
+                'status': 'success',
+                'message': 'Регистрация успешна',
+                'encryption_key': encryption_key
+            }
+
+        except sqlite3.IntegrityError as e:
+            error_str = str(e)
+            if "UNIQUE constraint failed: users.username" in error_str:
+                return {'status': 'error', 'message': 'Имя пользователя уже занято'}
+            elif "UNIQUE constraint failed: users.email" in error_str:
+                return {'status': 'error', 'message': 'Email уже зарегистрирован'}
+            else:
+                return {'status': 'error', 'message': 'Ошибка базы данных'}
+        except Exception as e:
+            print(f"Неожиданная ошибка при регистрации: {e}")
+            return {'status': 'error', 'message': 'Ошибка сервера'}
+
+    def handle_login(self, request):
+        username = request.get('username')
+        password_hash = request.get('password')
+
+        self.cursor.execute(
+            "SELECT password_hash, encryption_key FROM users WHERE username = ?",
+            (username,)
+        )
+        result = self.cursor.fetchone()
+
+        if not result:
+            return {'status': 'error', 'message': 'Пользователь не найден'}
+
+        stored_hash, encryption_key = result
+
+        if password_hash != stored_hash:
+            return {'status': 'error', 'message': 'Неверный пароль'}
+
+        # Обновляем время последнего входа
+        self.cursor.execute(
+            "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE username = ?",
+            (username,)
+        )
+        self.conn.commit()
+
+        print(f"Пользователь {username} успешно вошел")
+
+        return {
+            'status': 'success',
+            'message': 'Вход выполнен',
+            'encryption_key': encryption_key
+        }
+
+    def handle_send_message(self, request, sender):
+        if not sender:
+            return {'status': 'error', 'message': 'Не авторизован'}
+
+        receiver = request.get('receiver')
+        message = request.get('message')
+        timestamp = request.get('timestamp')
+
+        # Проверяем существование получателя
+        self.cursor.execute("SELECT username FROM users WHERE username = ?", (receiver,))
+        if not self.cursor.fetchone():
+            return {'status': 'error', 'message': 'Получатель не найден'}
+
+        # Сохраняем сообщение
+        self.cursor.execute(
+            "INSERT INTO messages (sender, receiver, message, timestamp) VALUES (?, ?, ?, ?)",
+            (sender, receiver, message, timestamp)
+        )
+        self.conn.commit()
+
+        # Отправляем уведомление получателю, если он онлайн
+        with self.lock:
+            if receiver in self.clients:
+                try:
+                    receiver_data = self.clients[receiver]
+                    notification = {
+                        'action': 'new_message',
+                        'sender': sender,
+                        'message': message,
+                        'timestamp': timestamp
+                    }
+
+                    if receiver_data['fernet']:
+                        encrypted_notification = receiver_data['fernet'].encrypt(
+                            json.dumps(notification).encode('utf-8')
+                        )
+                        receiver_socket = receiver_data['socket']
+                        receiver_socket.send(len(encrypted_notification).to_bytes(4, 'big'))
+                        receiver_socket.send(encrypted_notification)
+
+                        # Помечаем сообщение как доставленное
+                        self.cursor.execute(
+                            "UPDATE messages SET delivered = 1 WHERE sender = ? AND receiver = ? AND timestamp = ?",
+                            (sender, receiver, timestamp)
+                        )
+                        self.conn.commit()
+                except Exception as e:
+                    print(f"Ошибка отправки уведомления: {e}")
+
+        return {'status': 'success', 'message': 'Сообщение отправлено'}
+
+    def handle_send_file(self, request, sender):
+        if not sender:
+            return {'status': 'error', 'message': 'Не авторизован'}
+
+        receiver = request.get('receiver')
+        file_name = request.get('file_name')
+        file_data = request.get('file_data')
+        timestamp = request.get('timestamp')
+
+        # Проверяем существование получателя
+        self.cursor.execute("SELECT username FROM users WHERE username = ?", (receiver,))
+        if not self.cursor.fetchone():
+            return {'status': 'error', 'message': 'Получатель не найден'}
+
+        # Сохраняем файл
+        self.cursor.execute(
+            "INSERT INTO files (sender, receiver, file_name, file_data, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (sender, receiver, file_name, file_data, timestamp)
+        )
+        self.conn.commit()
+
+        return {'status': 'success', 'message': 'Файл отправлен'}
+
+    def handle_start_voice_call(self, request):
+        caller = request.get('caller')
+        receiver = request.get('receiver')
+
+        # Проверяем, онлайн ли получатель
+        with self.lock:
+            if receiver in self.clients:
+                return {'status': 'success', 'message': 'Получатель доступен'}
+            else:
+                return {'status': 'error', 'message': 'Получатель не в сети'}
+
+    def handle_get_messages(self, request):
+        user1 = request.get('user1')
+        user2 = request.get('user2')
+
+        self.cursor.execute(
+            """
+            SELECT sender, message, timestamp 
+            FROM messages 
+            WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
+            ORDER BY timestamp DESC
+            LIMIT 50
+            """,
+            (user1, user2, user2, user1)
+        )
+
+        messages = []
+        for row in self.cursor.fetchall():
+            messages.append({
+                'sender': row[0],
+                'message': row[1],
+                'timestamp': row[2]
+            })
+
+        messages.reverse()  # Чтобы старые сообщения были в начале
+        return {'status': 'success', 'messages': messages}
+
+    def handle_search_users(self, request):
+        query = request.get('query', '')
+
+        if not query:
+            # Возвращаем всех пользователей (кроме запрашивающего, если он указан)
+            self.cursor.execute("SELECT username, email FROM users")
+        else:
+            # Ищем только по имени пользователя
+            self.cursor.execute(
+                "SELECT username, email FROM users WHERE username LIKE ?",
+                (f"%{query}%",)
+            )
+
+        users = []
+        for row in self.cursor.fetchall():
+            # Не возвращаем email для сохранения конфиденциальности
+            users.append({
+                'username': row[0]
+            })
+
+        return {'status': 'success', 'users': users}
+
+    def handle_update_profile(self, request):
+        username = request.get('username')
+        avatar = request.get('avatar')
+        password = request.get('password')
+
+        try:
+            updates = []
+            params = []
+
+            if avatar:
+                updates.append("avatar = ?")
+                params.append(avatar)
+
+            if password:
+                updates.append("password_hash = ?")
+                params.append(password)
+
+            if not updates:
+                return {'status': 'error', 'message': 'Нет изменений для обновления'}
+
+            params.append(username)
+            query = f"UPDATE users SET {', '.join(updates)} WHERE username = ?"
+
+            self.cursor.execute(query, params)
+            self.conn.commit()
+
+            print(f"Профиль пользователя {username} обновлен")
+            return {'status': 'success', 'message': 'Профиль обновлен'}
+        except Exception as e:
+            print(f"Ошибка обновления профиля: {e}")
+            return {'status': 'error', 'message': 'Ошибка обновления профиля'}
+
+    def handle_get_user_avatar(self, request):
+        username = request.get('username')
+
+        self.cursor.execute(
+            "SELECT avatar FROM users WHERE username = ?",
+            (username,)
+        )
+        result = self.cursor.fetchone()
+
+        if result and result[0]:
+            return {'status': 'success', 'avatar': result[0]}
+        else:
+            return {'status': 'success', 'avatar': None}
+
+
+class ServerWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.server = SecureServer()
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("Secure Messenger Server")
+        self.setGeometry(200, 200, 1000, 700)
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        layout = QVBoxLayout()
+
+        server_panel = self.create_server_panel()
+        layout.addWidget(server_panel)
+
+        self.tabs = QTabWidget()
+
+        self.users_tab = QWidget()
+        self.init_users_tab()
+        self.tabs.addTab(self.users_tab, "Пользователи")
+
+        self.stats_tab = QWidget()
+        self.init_stats_tab()
+        self.tabs.addTab(self.stats_tab, "Статистика")
+
+        self.broadcast_tab = QWidget()
+        self.init_broadcast_tab()
+        self.tabs.addTab(self.broadcast_tab, "Рассылка")
+
+        self.logs_tab = QWidget()
+        self.init_logs_tab()
+        self.tabs.addTab(self.logs_tab, "Логи")
+
+        layout.addWidget(self.tabs)
+        central_widget.setLayout(layout)
+
+        self.create_menu()
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_stats)
+        self.timer.start(3000)
+
+    def create_server_panel(self):
+        panel = QWidget()
+        layout = QHBoxLayout()
+
+        self.start_btn = QPushButton("Запустить сервер")
+        self.start_btn.clicked.connect(self.start_server)
+        layout.addWidget(self.start_btn)
+
+        self.stop_btn = QPushButton("Остановить сервер")
+        self.stop_btn.clicked.connect(self.stop_server)
+        self.stop_btn.setEnabled(False)
+        layout.addWidget(self.stop_btn)
+
+        self.status_label = QLabel("Сервер остановлен")
+        self.status_label.setStyleSheet("color: red; font-weight: bold;")
+        layout.addWidget(self.status_label)
+
+        layout.addStretch()
+
+        self.clients_label = QLabel("Подключено: 0")
+        layout.addWidget(self.clients_label)
+
+        self.port_label = QLabel("Порт: 5555")
+        layout.addWidget(self.port_label)
+
+        panel.setLayout(layout)
+        return panel
+
+    def init_users_tab(self):
+        layout = QVBoxLayout()
+
+        search_panel = QWidget()
+        search_layout = QHBoxLayout()
+
+        search_layout.addWidget(QLabel("Поиск:"))
+        self.user_search_input = QLineEdit()
+        self.user_search_input.setPlaceholderText("Имя пользователя или email")
+        search_layout.addWidget(self.user_search_input)
+
+        self.search_btn = QPushButton("Найти")
+        self.search_btn.clicked.connect(self.search_users)
+        search_layout.addWidget(self.search_btn)
+
+        search_panel.setLayout(search_layout)
+        layout.addWidget(search_panel)
+
+        self.users_table = QTableWidget()
+        self.users_table.setColumnCount(6)
+        self.users_table.setHorizontalHeaderLabels([
+            "ID", "Имя", "Email", "Регистрация", "Последний вход", "Действия"
+        ])
+        self.users_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.users_table)
+
+        button_panel = QWidget()
+        button_layout = QHBoxLayout()
+
+        self.refresh_btn = QPushButton("Обновить")
+        self.refresh_btn.clicked.connect(self.load_users)
+        button_layout.addWidget(self.refresh_btn)
+
+        self.delete_btn = QPushButton("Удалить выбранных")
+        self.delete_btn.clicked.connect(self.delete_selected_users)
+        button_layout.addWidget(self.delete_btn)
+
+        button_panel.setLayout(button_layout)
+        layout.addWidget(button_panel)
+
+        self.users_tab.setLayout(layout)
+        self.load_users()
+
+    def init_stats_tab(self):
+        layout = QVBoxLayout()
+
+        stats_group = QGroupBox("Статистика сервера")
+        stats_layout = QVBoxLayout()
+
+        self.total_users_label = QLabel("Всего пользователей: 0")
+        stats_layout.addWidget(self.total_users_label)
+
+        self.online_users_label = QLabel("Онлайн пользователей: 0")
+        stats_layout.addWidget(self.online_users_label)
+
+        self.total_messages_label = QLabel("Всего сообщений: 0")
+        stats_layout.addWidget(self.total_messages_label)
+
+        self.total_files_label = QLabel("Всего файлов: 0")
+        stats_layout.addWidget(self.total_files_label)
+
+        stats_group.setLayout(stats_layout)
+        layout.addWidget(stats_group)
+
+        self.stats_tab.setLayout(layout)
+
+    def init_broadcast_tab(self):
+        layout = QVBoxLayout()
+
+        layout.addWidget(QLabel("Рассылка сообщений:"))
+
+        self.broadcast_subject = QLineEdit()
+        self.broadcast_subject.setPlaceholderText("Тема сообщения")
+        layout.addWidget(self.broadcast_subject)
+
+        self.broadcast_message = QTextEdit()
+        self.broadcast_message.setPlaceholderText("Текст сообщения...")
+        layout.addWidget(self.broadcast_message)
+
+        self.broadcast_btn = QPushButton("Отправить всем пользователям")
+        self.broadcast_btn.clicked.connect(self.send_broadcast)
+        layout.addWidget(self.broadcast_btn)
+
+        layout.addStretch()
+        self.broadcast_tab.setLayout(layout)
+
+    def init_logs_tab(self):
+        layout = QVBoxLayout()
+
+        self.logs_text = QTextEdit()
+        self.logs_text.setReadOnly(True)
+        layout.addWidget(self.logs_text)
+
+        button_panel = QWidget()
+        button_layout = QHBoxLayout()
+
+        self.clear_logs_btn = QPushButton("Очистить логи")
+        self.clear_logs_btn.clicked.connect(self.clear_logs)
+        button_layout.addWidget(self.clear_logs_btn)
+
+        self.save_logs_btn = QPushButton("Сохранить логи")
+        self.save_logs_btn.clicked.connect(self.save_logs)
+        button_layout.addWidget(self.save_logs_btn)
+
+        button_panel.setLayout(button_layout)
+        layout.addWidget(button_panel)
+
+        self.logs_tab.setLayout(layout)
+
+    def create_menu(self):
+        menubar = self.menuBar()
+
+        server_menu = menubar.addMenu('Сервер')
+
+        start_action = QAction('Запустить', self)
+        start_action.triggered.connect(self.start_server)
+        server_menu.addAction(start_action)
+
+        stop_action = QAction('Остановить', self)
+        stop_action.triggered.connect(self.stop_server)
+        server_menu.addAction(stop_action)
+
+        server_menu.addSeparator()
+
+        exit_action = QAction('Выход', self)
+        exit_action.triggered.connect(self.close)
+        server_menu.addAction(exit_action)
+
+    def start_server(self):
+        if self.server.start():
+            self.status_label.setText("✓ Сервер запущен")
+            self.status_label.setStyleSheet("color: green; font-weight: bold;")
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            self.log("Сервер запущен на порту 5555")
+        else:
+            QMessageBox.critical(self, "Ошибка", "Не удалось запустить сервер")
+
+    def stop_server(self):
+        self.server.stop()
+        self.status_label.setText("Сервер остановлен")
+        self.status_label.setStyleSheet("color: red; font-weight: bold;")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.log("Сервер остановлен")
+
+    def load_users(self):
+        try:
+            self.server.cursor.execute(
+                "SELECT id, username, email, registration_date, last_login FROM users ORDER BY id")
+            users = self.server.cursor.fetchall()
+
+            self.users_table.setRowCount(len(users))
+
+            for row, user in enumerate(users):
+                for col in range(5):
+                    value = user[col] if user[col] else ""
+                    self.users_table.setItem(row, col, QTableWidgetItem(str(value)))
+
+                # Кнопка удаления
+                delete_btn = QPushButton("Удалить")
+                delete_btn.clicked.connect(lambda checked, u=user[1]: self.delete_user(u))
+                self.users_table.setCellWidget(row, 5, delete_btn)
+
+                # Устанавливаем выравнивание
+                for col in range(5):
+                    item = self.users_table.item(row, col)
+                    if item:
+                        item.setTextAlignment(Qt.AlignCenter)
+        except Exception as e:
+            self.log(f"Ошибка загрузки пользователей: {e}")
+
+    def search_users(self):
+        query = self.user_search_input.text()
+        try:
+            if query:
+                self.server.cursor.execute(
+                    "SELECT id, username, email, registration_date, last_login FROM users WHERE username LIKE ? OR email LIKE ?",
+                    (f"%{query}%", f"%{query}%")
+                )
+            else:
+                self.server.cursor.execute(
+                    "SELECT id, username, email, registration_date, last_login FROM users ORDER BY id"
+                )
+
+            users = self.server.cursor.fetchall()
+
+            self.users_table.setRowCount(len(users))
+
+            for row, user in enumerate(users):
+                for col in range(5):
+                    value = user[col] if user[col] else ""
+                    self.users_table.setItem(row, col, QTableWidgetItem(str(value)))
+
+                delete_btn = QPushButton("Удалить")
+                delete_btn.clicked.connect(lambda checked, u=user[1]: self.delete_user(u))
+                self.users_table.setCellWidget(row, 5, delete_btn)
+
+                for col in range(5):
+                    item = self.users_table.item(row, col)
+                    if item:
+                        item.setTextAlignment(Qt.AlignCenter)
+        except Exception as e:
+            self.log(f"Ошибка поиска пользователей: {e}")
+
+    def delete_user(self, username):
+        reply = QMessageBox.question(
+            self, 'Подтверждение',
+            f'Удалить пользователя {username}?',
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            try:
+                self.server.cursor.execute("DELETE FROM users WHERE username = ?", (username,))
+                self.server.conn.commit()
+
+                # Удаляем из онлайн-списка
+                with self.server.lock:
+                    if username in self.server.clients:
+                        try:
+                            self.server.clients[username]['socket'].close()
+                        except:
+                            pass
+                        del self.server.clients[username]
+
+                self.load_users()
+                self.log(f"Пользователь {username} удален")
+            except Exception as e:
+                self.log(f"Ошибка удаления пользователя: {e}")
+
+    def delete_selected_users(self):
+        selected = self.users_table.selectionModel().selectedRows()
+        if selected:
+            reply = QMessageBox.question(
+                self, 'Подтверждение',
+                f'Удалить выбранных пользователей ({len(selected)} шт.)?',
+                QMessageBox.Yes | QMessageBox.No
+            )
+
+            if reply == QMessageBox.Yes:
+                for index in selected:
+                    username = self.users_table.item(index.row(), 1).text()
+                    self.delete_user(username)
+
+    def send_broadcast(self):
+        subject = self.broadcast_subject.text()
+        message = self.broadcast_message.toPlainText()
+
+        if not subject or not message:
+            QMessageBox.warning(self, "Ошибка", "Заполните тему и сообщение")
+            return
+
+        broadcast_data = {
+            'action': 'broadcast',
+            'subject': subject,
+            'message': message,
+            'timestamp': datetime.now().isoformat()
+        }
+
+        with self.server.lock:
+            count = len(self.server.clients)
+            for username, client_data in self.server.clients.items():
+                try:
+                    if client_data['fernet']:
+                        encrypted_data = client_data['fernet'].encrypt(
+                            json.dumps(broadcast_data).encode('utf-8')
+                        )
+                        client_data['socket'].send(len(encrypted_data).to_bytes(4, 'big'))
+                        client_data['socket'].send(encrypted_data)
+                except Exception as e:
+                    self.log(f"Ошибка отправки рассылки пользователю {username}: {e}")
+
+        QMessageBox.information(
+            self, "Рассылка",
+            f"Сообщение отправлено {count} пользователям"
+        )
+        self.broadcast_subject.clear()
+        self.broadcast_message.clear()
+        self.log(f"Рассылка отправлена: {subject}")
+
+    def update_stats(self):
+        try:
+            # Всего пользователей
+            self.server.cursor.execute("SELECT COUNT(*) FROM users")
+            total_users = self.server.cursor.fetchone()[0]
+            self.total_users_label.setText(f"Всего пользователей: {total_users}")
+
+            # Онлайн пользователей
+            with self.server.lock:
+                online_users = len(self.server.clients)
+                self.online_users_label.setText(f"Онлайн пользователей: {online_users}")
+                self.clients_label.setText(f"Подключено: {online_users}")
+
+            # Всего сообщений
+            self.server.cursor.execute("SELECT COUNT(*) FROM messages")
+            total_messages = self.server.cursor.fetchone()[0]
+            self.total_messages_label.setText(f"Всего сообщений: {total_messages}")
+
+            # Всего файлов
+            self.server.cursor.execute("SELECT COUNT(*) FROM files")
+            total_files = self.server.cursor.fetchone()[0]
+            self.total_files_label.setText(f"Всего файлов: {total_files}")
+
+        except Exception as e:
+            print(f"Ошибка обновления статистики: {e}")
+
+    def log(self, message):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.logs_text.append(f"[{timestamp}] {message}")
+
+    def clear_logs(self):
+        self.logs_text.clear()
+
+    def save_logs(self):
+        file_name, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить логи", "", "Text Files (*.txt)"
+        )
+        if file_name:
+            try:
+                with open(file_name, 'w', encoding='utf-8') as f:
+                    f.write(self.logs_text.toPlainText())
+                self.log(f"Логи сохранены в {file_name}")
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить логи: {e}")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    server = ServerWindow()
+    server.show()
+    sys.exit(app.exec_())
